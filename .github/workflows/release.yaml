@@ -5,7 +5,7 @@ on:
     tags:
       - v*
     branches:
-      - master
+      - main
       - dev-*
 
 concurrency:
@@ -20,105 +20,22 @@ permissions:
   contents: read
 
 jobs:
-  build-linux-amd64:
-    name: Build & push linux/amd64
+  build-linux:
+    name: Build & push linux
     if: github.repository == 'argoproj/argo-workflows'
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        platform: [ linux/amd64 ]
+        platform: [ linux/amd64, linux/arm64 ]
         target: [ workflow-controller, argocli, argoexec ]
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-        with:
-          version: v0.10.4
-
-      - name: Cache Docker layers
-        uses: actions/cache@v3
-        id: cache
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-${{ matrix.platform }}-${{ matrix.target }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.platform }}-${{ matrix.target }}-buildx-
-
-      - name: Docker Login
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERIO_USERNAME }}
-          password: ${{ secrets.DOCKERIO_PASSWORD }}
-
-      - name: Docker Login
-        uses: docker/login-action@v2
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAYIO_USERNAME }}
-          password: ${{ secrets.QUAYIO_PASSWORD }}
-
-      - name: Docker Buildx
-        env:
-          DOCKERIO_ORG: ${{ secrets.DOCKERIO_ORG }}
-          PLATFORM: ${{ matrix.platform }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -eux
-          tag=$(basename $GITHUB_REF)
-          if [ $tag = "master" ]; then
-            tag="latest"
-          fi
-          # copied verbatim from Makefile
-          GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
-          GIT_TAG=$(git describe --exact-match --tags --abbrev=0  2> /dev/null || echo untagged)
-          GIT_TREE_STATE=$(if [ -z "`git status --porcelain`" ]; then echo "clean" ; else echo "dirty"; fi)
-  
-          tag_suffix=$(echo $PLATFORM | sed -r "s/\//-/g")
-          image_name="${DOCKERIO_ORG}/${TARGET}:${tag}-${tag_suffix}"
-
-          docker buildx build \
-            --cache-from "type=local,src=/tmp/.buildx-cache" \
-            --cache-to "type=local,dest=/tmp/.buildx-cache" \
-            --output "type=image,push=true" \
-            --build-arg GIT_COMMIT=$GIT_COMMIT \
-            --build-arg GIT_TAG=$GIT_TAG \
-            --build-arg GIT_TREE_STATE=$GIT_TREE_STATE \
-            --platform="${PLATFORM}" \
-            --target $TARGET \
-            --provenance=false \
-            --tag $image_name .
-
-          docker buildx build \
-            --cache-from "type=local,src=/tmp/.buildx-cache" \
-            --cache-to "type=local,dest=/tmp/.buildx-cache" \
-            --output "type=image,push=true" \
-            --build-arg GIT_COMMIT=$GIT_COMMIT \
-            --build-arg GIT_TAG=$GIT_TAG \
-            --build-arg GIT_TREE_STATE=$GIT_TREE_STATE \
-            --platform="${PLATFORM}" \
-            --target $TARGET \
-            --provenance=false \
-            --tag quay.io/$image_name .
-
-  build-linux-arm64:
-    name: Build & push linux/arm64
-    if: github.repository == 'argoproj/argo-workflows'
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        platform: [ linux/arm64 ]
-        target: [ workflow-controller, argocli, argoexec ]
-    steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-        with:
-          platforms: arm64
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
         with:
           version: v0.10.4
 
@@ -132,13 +49,13 @@ jobs:
             ${{ runner.os }}-${{ matrix.platform }}-${{ matrix.target }}-buildx-
 
       - name: Docker Login
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERIO_USERNAME }}
           password: ${{ secrets.DOCKERIO_PASSWORD }}
 
       - name: Docker Login
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: quay.io
           username: ${{ secrets.QUAYIO_USERNAME }}
@@ -152,14 +69,13 @@ jobs:
         run: |
           set -eux
           tag=$(basename $GITHUB_REF)
-          if [ $tag = "master" ]; then
+          if [ $tag = "main" ]; then
             tag="latest"
           fi
           # copied verbatim from Makefile
           GIT_COMMIT=$(git rev-parse HEAD || echo unknown)
           GIT_TAG=$(git describe --exact-match --tags --abbrev=0  2> /dev/null || echo untagged)
           GIT_TREE_STATE=$(if [ -z "`git status --porcelain`" ]; then echo "clean" ; else echo "dirty"; fi)
-          
           tag_suffix=$(echo $PLATFORM | sed -r "s/\//-/g")
           image_name="${DOCKERIO_ORG}/${TARGET}:${tag}-${tag_suffix}"
 
@@ -173,26 +89,15 @@ jobs:
             --platform="${PLATFORM}" \
             --target $TARGET \
             --provenance=false \
-            --tag $image_name .
-
-          docker buildx build \
-            --cache-from "type=local,src=/tmp/.buildx-cache" \
-            --cache-to "type=local,dest=/tmp/.buildx-cache" \
-            --output "type=image,push=true" \
-            --build-arg GIT_COMMIT=$GIT_COMMIT \
-            --build-arg GIT_TAG=$GIT_TAG \
-            --build-arg GIT_TREE_STATE=$GIT_TREE_STATE \
-            --platform="${PLATFORM}" \
-            --target $TARGET \
-            --provenance=false \
+            --tag $image_name \
             --tag quay.io/$image_name .
 
   build-windows:
     name: Build & push windows
     if: github.repository == 'argoproj/argo-workflows'
-    runs-on: windows-2019
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Docker Login
         uses: Azure/docker-login@v1
         with:
@@ -205,7 +110,7 @@ jobs:
           login-server: quay.io
           username: ${{ secrets.QUAYIO_USERNAME }}
           password: ${{ secrets.QUAYIO_PASSWORD }}
-   
+
       - name: Build & Push Windows Docker Images
         env:
           DOCKERIO_ORG: ${{ secrets.DOCKERIO_ORG }}
@@ -213,7 +118,7 @@ jobs:
           docker_org=$DOCKERIO_ORG
 
           tag=$(basename $GITHUB_REF)
-          if [ $tag = "master" ]; then
+          if [ $tag = "main" ]; then
             tag="latest"
           fi
 
@@ -228,7 +133,7 @@ jobs:
               -t $image_name \
               -f Dockerfile.windows \
               .
-          
+
             docker push $image_name
 
             docker tag $image_name quay.io/$image_name
@@ -240,9 +145,9 @@ jobs:
     name: Push manifest with all images
     if: github.repository == 'argoproj/argo-workflows'
     runs-on: ubuntu-latest
-    needs: [ build-linux-amd64, build-linux-arm64, build-windows ]
+    needs: [ build-linux, build-windows ]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Docker Login
         uses: Azure/docker-login@v1
         with:
@@ -272,7 +177,7 @@ jobs:
           docker_org=$DOCKERIO_ORG
 
           tag=$(basename $GITHUB_REF)
-          if [ $tag = "master" ]; then
+          if [ $tag = "main" ]; then
             tag="latest"
           fi
 
@@ -325,7 +230,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           tag=$(basename $GITHUB_REF)
-          if [ $tag = "master" ]; then
+          if [ $tag = "main" ]; then
             tag="latest"
           fi
 
@@ -336,7 +241,7 @@ jobs:
   test-images-windows:
     name: Try pulling windows
     if: github.repository == 'argoproj/argo-workflows'
-    runs-on: windows-2019
+    runs-on: windows-2022
     needs: [ push-images ]
     steps:
       - name: Docker Login
@@ -357,7 +262,7 @@ jobs:
         run: |
           docker_org=$DOCKERIO_ORG
           tag=$(basename $GITHUB_REF)
-          if [ $tag = "master" ]; then
+          if [ $tag = "main" ]; then
             tag="latest"
           fi
 
@@ -379,32 +284,25 @@ jobs:
       COSIGN_PRIVATE_KEY: ${{secrets.COSIGN_PRIVATE_KEY}}
       COSIGN_PASSWORD: ${{secrets.COSIGN_PASSWORD}}
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "16"
-      - uses: actions/setup-go@v4
+          node-version: "20" # change in all GH Workflows
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.20"
-      - uses: actions/cache@v3
+          go-version: "1.21"
+      - name: Restore node packages cache
+        uses: actions/cache@v3
         with:
           path: ui/node_modules
           key: ${{ runner.os }}-node-dep-v1-${{ hashFiles('**/yarn.lock') }}
-      - uses: actions/cache@v3
-        with:
-          path: /home/runner/.cache/go-build
-          key: GOCACHE-v2-${{ hashFiles('**/go.mod') }}
-      - uses: actions/cache@v3
-        with:
-          path: /home/runner/go/pkg/mod
-          key: GOMODCACHE-v2-${{ hashFiles('**/go.mod') }}
       - name: Install cosign
         uses: sigstore/cosign-installer@main
         with:
           cosign-release: 'v1.13.0'
       # https://stackoverflow.com/questions/58033366/how-to-get-current-branch-within-github-actions
       - run: |
-          if [ ${GITHUB_REF##*/} = master ]; then
+          if [ ${GITHUB_REF##*/} = main ]; then
            echo "VERSION=latest" >> $GITHUB_ENV
           else
             echo "VERSION=${GITHUB_REF##*/}" >> $GITHUB_ENV

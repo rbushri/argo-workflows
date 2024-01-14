@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/handlers"
@@ -142,8 +143,11 @@ func NewArgoServer(ctx context.Context, opts ArgoServerOpts) (*argoServer, error
 		if err != nil {
 			return nil, err
 		}
-		resourceCache = cache.NewResourceCache(opts.Clients.Kubernetes, getResourceCacheNamespace(opts))
-		resourceCache.Run(ctx.Done())
+		if ssoIf.IsRBACEnabled() {
+			// resourceCache is only used for SSO RBAC
+			resourceCache = cache.NewResourceCache(opts.Clients.Kubernetes, getResourceCacheNamespace(opts))
+			resourceCache.Run(ctx.Done())
+		}
 		log.Info("SSO enabled")
 	} else {
 		log.Info("SSO disabled")
@@ -322,8 +326,13 @@ func (as *argoServer) newGRPCServer(instanceIDService instanceid.Service, offloa
 // using grpc-gateway as a proxy to the gRPC server.
 func (as *argoServer) newHTTPServer(ctx context.Context, port int, artifactServer *artifacts.ArtifactServer) *http.Server {
 	endpoint := fmt.Sprintf("localhost:%d", port)
+	ipKeyFunc := httplimit.IPKeyFunc()
+	if ipKeyFuncHeadersStr := env.GetString("IP_KEY_FUNC_HEADERS", ""); ipKeyFuncHeadersStr != "" {
+		ipKeyFuncHeaders := strings.Split(ipKeyFuncHeadersStr, ",")
+		ipKeyFunc = httplimit.IPKeyFunc(ipKeyFuncHeaders...)
+	}
 
-	ratelimit_middleware, err := httplimit.NewMiddleware(as.apiRateLimiter, httplimit.IPKeyFunc())
+	rateLimitMiddleware, err := httplimit.NewMiddleware(as.apiRateLimiter, ipKeyFunc)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -331,7 +340,7 @@ func (as *argoServer) newHTTPServer(ctx context.Context, port int, artifactServe
 	mux := http.NewServeMux()
 	httpServer := http.Server{
 		Addr:      endpoint,
-		Handler:   ratelimit_middleware.Handle(accesslog.Interceptor(mux)),
+		Handler:   rateLimitMiddleware.Handle(accesslog.Interceptor(mux)),
 		TLSConfig: as.tlsConfig,
 	}
 	dialOpts := []grpc.DialOption{

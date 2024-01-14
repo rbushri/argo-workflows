@@ -1,3 +1,5 @@
+//go:build !windows
+
 package v1alpha1
 
 import (
@@ -328,7 +330,7 @@ func TestArtifactoryArtifact(t *testing.T) {
 }
 
 func TestAzureArtifact(t *testing.T) {
-	a := &AzureArtifact{Blob: "my-blob", AzureBlobContainer: AzureBlobContainer{Container: "my-container"}}
+	a := &AzureArtifact{Blob: "my-blob", AzureBlobContainer: AzureBlobContainer{Endpoint: "my-endpoint", Container: "my-container"}}
 	assert.True(t, a.HasLocation())
 	assert.NoError(t, a.SetKey("my-blob"))
 	key, err := a.GetKey()
@@ -433,7 +435,7 @@ func TestArtifactLocation_Get(t *testing.T) {
 
 	v, err = (&ArtifactLocation{}).Get()
 	assert.Nil(t, v)
-	assert.EqualError(t, err, "You need to configure artifact storage. More information on how to do this can be found in the docs: https://argoproj.github.io/argo-workflows/configure-artifact-repository/")
+	assert.EqualError(t, err, "You need to configure artifact storage. More information on how to do this can be found in the docs: https://argo-workflows.readthedocs.io/en/latest/configure-artifact-repository/")
 
 	v, _ = (&ArtifactLocation{Azure: &AzureArtifact{}}).Get()
 	assert.IsType(t, &AzureArtifact{}, v)

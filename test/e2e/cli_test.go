@@ -256,7 +256,7 @@ func (s *CLISuite) TestLogs() {
 		WaitForWorkflow(fixtures.ToStart).
 		WaitForWorkflow(fixtures.Condition(func(wf *wfv1.Workflow) (bool, string) {
 			return wf.Status.Nodes.FindByDisplayName(wf.Name) != nil, "pod running"
-		}), 10*time.Second).
+		}), 40*time.Second).
 		Then().
 		ExpectWorkflow(func(t *testing.T, metadata *metav1.ObjectMeta, status *wfv1.WorkflowStatus) {
 			name = metadata.Name
@@ -351,7 +351,7 @@ func (s *CLISuite) TestLogProblems() {
 		Workflow(`@testdata/log-problems.yaml`).
 		When().
 		SubmitWorkflow().
-		WaitForWorkflow(fixtures.ToStart).
+		WaitForWorkflow(fixtures.ToHaveRunningPod).
 		Then().
 		// logs should come in order
 		RunCli([]string{"logs", "@latest", "--follow"}, func(t *testing.T, output string, err error) {
@@ -836,7 +836,7 @@ func (s *CLISuite) TestWorkflowRetry() {
 		WaitForWorkflow(fixtures.ToStart).
 		WaitForWorkflow(fixtures.Condition(func(wf *wfv1.Workflow) (bool, string) {
 			return wf.Status.AnyActiveSuspendNode(), "suspended node"
-		}), time.Minute).
+		}), time.Second*90).
 		RunCli([]string{"terminate", "@latest"}, func(t *testing.T, output string, err error) {
 			if assert.NoError(t, err) {
 				assert.Regexp(t, "workflow retry-test-.* terminated", output)
@@ -855,7 +855,7 @@ func (s *CLISuite) TestWorkflowRetry() {
 		}).
 		WaitForWorkflow(fixtures.Condition(func(wf *wfv1.Workflow) (bool, string) {
 			return wf.Status.AnyActiveSuspendNode(), "suspended node"
-		}), time.Minute).
+		}), time.Second*90).
 		Then().
 		ExpectWorkflow(func(t *testing.T, _ *metav1.ObjectMeta, status *wfv1.WorkflowStatus) {
 			outerStepsPodNode := status.Nodes.FindByDisplayName("steps-outer-step1")
@@ -1272,6 +1272,30 @@ func (s *CLISuite) TestCron() {
 			}
 		})
 	})
+
+	s.Run("List with labels", func() {
+		// First create cron workflow with labels
+		s.Given().RunCli([]string{"cron", "create", "cron/cron-workflow-with-labels.yaml"}, func(t *testing.T, output string, err error) {
+			assert.NoError(t, err)
+		}).
+			// Then create cron workflow without labels
+			RunCli([]string{"cron", "create", "cron/basic.yaml", "--name", "cron-wf-without-labels"}, func(t *testing.T, output string, err error) {
+				assert.NoError(t, err)
+			}).
+			// Then check to make sure only cron workflow with labels shows up from 'argo cron list...'
+			RunCli([]string{"cron", "list", "-l client=importantclient"}, func(t *testing.T, output string, err error) {
+				if assert.NoError(t, err) {
+					assert.Contains(t, output, "NAME")
+					assert.Contains(t, output, "AGE")
+					assert.Contains(t, output, "LAST RUN")
+					assert.Contains(t, output, "SCHEDULE")
+					assert.Contains(t, output, "SUSPENDED")
+					assert.Contains(t, output, "test-cwf-with-labels")
+					assert.NotContains(t, output, "cron-wf-without-labels")
+				}
+			})
+	})
+
 	s.Run("Suspend", func() {
 		s.Given().RunCli([]string{"cron", "suspend", "test-cron-wf-basic"}, func(t *testing.T, output string, err error) {
 			if assert.NoError(t, err) {
@@ -1681,7 +1705,23 @@ spec:
 			}
 			nodeStatus = status.Nodes.FindByDisplayName("approve")
 			if assert.NotNil(t, nodeStatus) {
-				assert.Equal(t, "Test message", nodeStatus.Message)
+				assert.Equal(t, "Test message; Resumed by: map[User:system:serviceaccount:argo:argo-server]", nodeStatus.Message)
+			}
+		})
+}
+
+func (s *CLISuite) TestPluginStruct() {
+	s.setMode(GRPC)
+	s.Given().
+		Workflow("@testdata/plugins/executor/template-executor-workflow.yaml").
+		When().
+		SubmitWorkflow().
+		Then().
+		RunCli([]string{"get", "@latest", "-o", "yaml"}, func(t *testing.T, output string, err error) {
+			if assert.NoError(t, err) {
+				wf := wfv1.Workflow{}
+				assert.NoError(t, yaml.UnmarshalStrict([]byte(output), &wf))
+				assert.NotNil(t, wf.Spec.Templates[0].Plugin)
 			}
 		})
 }

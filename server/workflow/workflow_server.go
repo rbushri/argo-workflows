@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -128,6 +129,42 @@ func (s *workflowServer) GetWorkflow(ctx context.Context, req *workflowpkg.Workf
 	return wf, nil
 }
 
+func mergeWithArchivedWorkflows(liveWfs wfv1.WorkflowList, archivedWfs wfv1.WorkflowList, numWfsToKeep int) *wfv1.WorkflowList {
+	var mergedWfs []wfv1.Workflow
+	var uidToWfs = map[types.UID][]wfv1.Workflow{}
+	for _, item := range liveWfs.Items {
+		uidToWfs[item.UID] = append(uidToWfs[item.UID], item)
+	}
+	for _, item := range archivedWfs.Items {
+		uidToWfs[item.UID] = append(uidToWfs[item.UID], item)
+	}
+
+	for _, v := range uidToWfs {
+		// The archived workflow we saved in the database have "Persisted" as the archival status.
+		// Prioritize 'Archived' over 'Persisted' because 'Archived' means the workflow is in the cluster
+		if len(v) == 1 {
+			mergedWfs = append(mergedWfs, v[0])
+		} else {
+			if ok := v[0].Labels[common.LabelKeyWorkflowArchivingStatus] == "Archived"; ok {
+				mergedWfs = append(mergedWfs, v[0])
+			} else {
+				mergedWfs = append(mergedWfs, v[1])
+			}
+		}
+	}
+	mergedWfsList := wfv1.WorkflowList{Items: mergedWfs, ListMeta: liveWfs.ListMeta}
+	sort.Sort(mergedWfsList.Items)
+	numWfs := 0
+	var finalWfs []wfv1.Workflow
+	for _, item := range mergedWfsList.Items {
+		if numWfsToKeep == 0 || numWfs < numWfsToKeep {
+			finalWfs = append(finalWfs, item)
+			numWfs += 1
+		}
+	}
+	return &wfv1.WorkflowList{Items: finalWfs, ListMeta: liveWfs.ListMeta}
+}
+
 func (s *workflowServer) ListWorkflows(ctx context.Context, req *workflowpkg.WorkflowListRequest) (*wfv1.WorkflowList, error) {
 	wfClient := auth.GetWfClient(ctx)
 
@@ -140,6 +177,19 @@ func (s *workflowServer) ListWorkflows(ctx context.Context, req *workflowpkg.Wor
 	if err != nil {
 		return nil, sutils.ToStatusError(err, codes.Internal)
 	}
+	archivedWfList, err := s.wfArchiveServer.ListArchivedWorkflows(ctx, &workflowarchivepkg.ListArchivedWorkflowsRequest{
+		ListOptions: listOption,
+		NamePrefix:  "",
+		Namespace:   req.Namespace,
+	})
+	if err != nil {
+		log.Warnf("unable to list archived workflows:%v", err)
+	} else {
+		if archivedWfList != nil {
+			wfList = mergeWithArchivedWorkflows(*wfList, *archivedWfList, int(listOption.Limit))
+		}
+	}
+
 	cleaner := fields.NewCleaner(req.Fields)
 	if s.offloadNodeStatusRepo.IsEnabled() && !cleaner.WillExclude("items.status.nodes") {
 		offloadedNodes, err := s.offloadNodeStatusRepo.List(req.Namespace)
@@ -321,6 +371,15 @@ func (s *workflowServer) DeleteWorkflow(ctx context.Context, req *workflowpkg.Wo
 	return &workflowpkg.WorkflowDeleteResponse{}, nil
 }
 
+func errorFromChannel(errCh <-chan error) error {
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	return nil
+}
+
 func (s *workflowServer) RetryWorkflow(ctx context.Context, req *workflowpkg.WorkflowRetryRequest) (*wfv1.Workflow, error) {
 	wfClient := auth.GetWfClient(ctx)
 	kubeClient := auth.GetKubeClient(ctx)
@@ -345,12 +404,25 @@ func (s *workflowServer) RetryWorkflow(ctx context.Context, req *workflowpkg.Wor
 		return nil, sutils.ToStatusError(err, codes.Internal)
 	}
 
+	errCh := make(chan error, len(podsToDelete))
+	var wg sync.WaitGroup
+	wg.Add(len(podsToDelete))
 	for _, podName := range podsToDelete {
 		log.WithFields(log.Fields{"podDeleted": podName}).Info("Deleting pod")
-		err := kubeClient.CoreV1().Pods(wf.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
-		if err != nil && !apierr.IsNotFound(err) {
-			return nil, sutils.ToStatusError(err, codes.Internal)
-		}
+		go func(podName string) {
+			defer wg.Done()
+			err := kubeClient.CoreV1().Pods(wf.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+			if err != nil && !apierr.IsNotFound(err) {
+				errCh <- err
+				return
+			}
+		}(podName)
+	}
+	wg.Wait()
+
+	err = errorFromChannel(errCh)
+	if err != nil {
+		return nil, sutils.ToStatusError(err, codes.Internal)
 	}
 
 	err = s.hydrator.Dehydrate(wf)
@@ -378,7 +450,7 @@ func (s *workflowServer) ResubmitWorkflow(ctx context.Context, req *workflowpkg.
 		return nil, sutils.ToStatusError(err, codes.InvalidArgument)
 	}
 
-	newWF, err := util.FormulateResubmitWorkflow(wf, req.Memoized, req.Parameters)
+	newWF, err := util.FormulateResubmitWorkflow(ctx, wf, req.Memoized, req.Parameters)
 	if err != nil {
 		return nil, sutils.ToStatusError(err, codes.Internal)
 	}
@@ -590,14 +662,17 @@ func (s *workflowServer) getWorkflow(ctx context.Context, wfClient versioned.Int
 		log.Debugf("Resolved alias %s to workflow %s.\n", latestAlias, latest.Name)
 		return latest, nil
 	}
-	wf, err := wfClient.ArgoprojV1alpha1().Workflows(namespace).Get(ctx, name, options)
-	if wf == nil || err != nil {
+	var err error
+	wf, origErr := wfClient.ArgoprojV1alpha1().Workflows(namespace).Get(ctx, name, options)
+	if wf == nil || origErr != nil {
 		wf, err = s.wfArchiveServer.GetArchivedWorkflow(ctx, &workflowarchivepkg.GetArchivedWorkflowRequest{
 			Namespace: namespace,
 			Name:      name,
 		})
 		if err != nil {
-			return nil, sutils.ToStatusError(err, codes.Internal)
+			log.Errorf("failed to get live workflow: %v; failed to get archived workflow: %v", origErr, err)
+			// We only return the original error to preserve the original status code.
+			return nil, sutils.ToStatusError(origErr, codes.Internal)
 		}
 	}
 	return wf, nil

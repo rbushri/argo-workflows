@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	gosync "sync"
 	"syscall"
 	"time"
+
+	"github.com/upper/db/v4"
 
 	"github.com/argoproj/pkg/errors"
 	syncpkg "github.com/argoproj/pkg/sync"
@@ -32,7 +35,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 	apiwatch "k8s.io/client-go/tools/watch"
 	"k8s.io/client-go/util/workqueue"
-	"upper.io/db.v3/lib/sqlbuilder"
 
 	"github.com/argoproj/argo-workflows/v3"
 	"github.com/argoproj/argo-workflows/v3/config"
@@ -66,6 +68,18 @@ import (
 	plugin "github.com/argoproj/argo-workflows/v3/workflow/util/plugins"
 )
 
+const maxAllowedStackDepth = 100
+
+type recentlyCompletedWorkflow struct {
+	key  string
+	when time.Time
+}
+
+type recentCompletions struct {
+	completions []recentlyCompletedWorkflow
+	mutex       gosync.RWMutex
+}
+
 // WorkflowController is the controller for workflow resources
 type WorkflowController struct {
 	// namespace of the workflow controller
@@ -97,6 +111,10 @@ type WorkflowController struct {
 	dynamicInterface dynamic.Interface
 	wfclientset      wfclientset.Interface
 
+	// maxStackDepth is a configurable limit to the depth of the "stack", which is increased with every nested call to
+	// woc.executeTemplate and decreased when such calls return. This is used to prevent infinite recursion
+	maxStackDepth int
+
 	// datastructures to support the processing of workflows and workflow pods
 	wfInformer            cache.SharedIndexInformer
 	wftmplInformer        wfextvv1alpha1.WorkflowTemplateInformer
@@ -107,7 +125,7 @@ type WorkflowController struct {
 	podCleanupQueue       workqueue.RateLimitingInterface // pods to be deleted or labelled depend on GC strategy
 	throttler             sync.Throttler
 	workflowKeyLock       syncpkg.KeyLock // used to lock workflows for exclusive modification or access
-	session               sqlbuilder.Database
+	session               db.Session
 	offloadNodeStatusRepo sqldb.OffloadNodeStatusRepo
 	hydrator              hydrator.Interface
 	wfArchive             sqldb.WorkflowArchive
@@ -128,6 +146,8 @@ type WorkflowController struct {
 	// Default is 3s and can be configured using the env var ARGO_PROGRESS_FILE_TICK_DURATION
 	progressFileTickDuration time.Duration
 	executorPlugins          map[string]map[string]*spec.Plugin // namespace -> name -> plugin
+
+	recentCompletions recentCompletions
 }
 
 const (
@@ -188,7 +208,7 @@ func NewWorkflowController(ctx context.Context, restConfig *rest.Config, kubecli
 	}
 
 	wfc.UpdateConfig(ctx)
-
+	wfc.maxStackDepth = wfc.getMaxStackDepth()
 	wfc.metrics = metrics.New(wfc.getMetricsServerConfig())
 	wfc.entrypoint = entrypoint.New(kubeclientset, wfc.Config.Images)
 
@@ -219,10 +239,10 @@ func (wfc *WorkflowController) runGCcontroller(ctx context.Context, workflowTTLW
 	}
 }
 
-func (wfc *WorkflowController) runCronController(ctx context.Context) {
+func (wfc *WorkflowController) runCronController(ctx context.Context, cronWorkflowWorkers int) {
 	defer runtimeutil.HandleCrash(runtimeutil.PanicHandlers...)
 
-	cronController := cron.NewCronController(wfc.wfclientset, wfc.dynamicInterface, wfc.namespace, wfc.GetManagedNamespace(), wfc.Config.InstanceID, wfc.metrics, wfc.eventRecorderManager)
+	cronController := cron.NewCronController(wfc.wfclientset, wfc.dynamicInterface, wfc.namespace, wfc.GetManagedNamespace(), wfc.Config.InstanceID, wfc.metrics, wfc.eventRecorderManager, cronWorkflowWorkers, wfc.wftmplInformer, wfc.cwftmplInformer)
 	cronController.Run(ctx)
 }
 
@@ -237,8 +257,13 @@ var indexers = cache.Indexers{
 }
 
 // Run starts an Workflow resource controller
-func (wfc *WorkflowController) Run(ctx context.Context, wfWorkers, workflowTTLWorkers, podCleanupWorkers int) {
+func (wfc *WorkflowController) Run(ctx context.Context, wfWorkers, workflowTTLWorkers, podCleanupWorkers, cronWorkflowWorkers int) {
 	defer runtimeutil.HandleCrash(runtimeutil.PanicHandlers...)
+
+	// init DB after leader election (if enabled)
+	if err := wfc.initDB(); err != nil {
+		log.Fatalf("Failed to init db: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -249,12 +274,12 @@ func (wfc *WorkflowController) Run(ctx context.Context, wfWorkers, workflowTTLWo
 	log.WithField("version", argo.GetVersion().Version).
 		WithField("defaultRequeueTime", GetRequeueTime()).
 		Info("Starting Workflow Controller")
-	log.WithField("workflow", wfWorkers).
-		WithField("workflowTtl", workflowTTLWorkers).
+	log.WithField("workflowWorkers", wfWorkers).
+		WithField("workflowTtlWorkers", workflowTTLWorkers).
 		WithField("podCleanup", podCleanupWorkers).
 		Info("Current Worker Numbers")
 
-	wfc.wfInformer = util.NewWorkflowInformer(wfc.dynamicInterface, wfc.GetManagedNamespace(), workflowResyncPeriod, wfc.tweakListOptions, indexers)
+	wfc.wfInformer = util.NewWorkflowInformer(wfc.dynamicInterface, wfc.GetManagedNamespace(), workflowResyncPeriod, wfc.tweakListRequestListOptions, wfc.tweakWatchRequestListOptions, indexers)
 	wfc.wftmplInformer = informer.NewTolerantWorkflowTemplateInformer(wfc.dynamicInterface, workflowTemplateResyncPeriod, wfc.managedNamespace)
 	wfc.wfTaskSetInformer = wfc.newWorkflowTaskSetInformer()
 	wfc.artGCTaskInformer = wfc.newArtGCTaskInformer()
@@ -297,9 +322,6 @@ func (wfc *WorkflowController) Run(ctx context.Context, wfWorkers, workflowTTLWo
 		log.Fatal("Timed out waiting for caches to sync")
 	}
 
-	// Start the metrics server
-	go wfc.metrics.RunServer(ctx)
-
 	for i := 0; i < podCleanupWorkers; i++ {
 		go wait.UntilWithContext(ctx, wfc.runPodCleanup, time.Second)
 	}
@@ -307,7 +329,7 @@ func (wfc *WorkflowController) Run(ctx context.Context, wfWorkers, workflowTTLWo
 	go wfc.archivedWorkflowGarbageCollector(ctx.Done())
 
 	go wfc.runGCcontroller(ctx, workflowTTLWorkers)
-	go wfc.runCronController(ctx)
+	go wfc.runCronController(ctx, cronWorkflowWorkers)
 	go wait.Until(wfc.syncWorkflowPhaseMetrics, 15*time.Second, ctx.Done())
 	go wait.Until(wfc.syncPodPhaseMetrics, 15*time.Second, ctx.Done())
 
@@ -320,6 +342,10 @@ func (wfc *WorkflowController) Run(ctx context.Context, wfWorkers, workflowTTLWo
 		go wait.JitterUntilWithContext(ctx, wfc.syncAllCacheForGC, cacheGCPeriod, 0.0, true)
 	}
 	<-ctx.Done()
+}
+
+func (wfc *WorkflowController) RunMetricsServer(ctx context.Context, isDummy bool) {
+	go wfc.metrics.RunServer(ctx, isDummy)
 }
 
 // Create and the Synchronization Manager
@@ -365,7 +391,7 @@ func (wfc *WorkflowController) initManagers(ctx context.Context) error {
 		labelSelector = labelSelector.Add(*req)
 	}
 	listOpts := metav1.ListOptions{LabelSelector: labelSelector.String()}
-	wfList, err := wfc.wfclientset.ArgoprojV1alpha1().Workflows(wfc.namespace).List(ctx, listOpts)
+	wfList, err := wfc.wfclientset.ArgoprojV1alpha1().Workflows(wfc.GetManagedNamespace()).List(ctx, listOpts)
 	if err != nil {
 		return err
 	}
@@ -499,7 +525,10 @@ func (wfc *WorkflowController) processNextPodCleanupItem(ctx context.Context) bo
 		pods := wfc.kubeclientset.CoreV1().Pods(namespace)
 		switch action {
 		case terminateContainers:
-			if terminationGracePeriod, err := wfc.signalContainers(namespace, podName, syscall.SIGTERM); err != nil {
+			pod, err := wfc.getPod(namespace, podName)
+			if err == nil && pod != nil && pod.Status.Phase == apiv1.PodPending {
+				wfc.queuePodForCleanup(namespace, podName, deletePod)
+			} else if terminationGracePeriod, err := wfc.signalContainers(namespace, podName, syscall.SIGTERM); err != nil {
 				return err
 			} else if terminationGracePeriod > 0 {
 				wfc.queuePodForCleanupAfter(namespace, podName, killContainers, terminationGracePeriod)
@@ -735,6 +764,11 @@ func (wfc *WorkflowController) processNextItem(ctx context.Context) bool {
 		return true
 	}
 
+	if wf.Status.Phase != "" && wfc.checkRecentlyCompleted(wf.ObjectMeta.Name) {
+		log.WithFields(log.Fields{"name": wf.ObjectMeta.Name}).Warn("Cache: Rejecting recently deleted")
+		return true
+	}
+
 	// this will ensure we process every incomplete workflow once every 20m
 	wfc.wfQueue.AddAfter(key, workflowResyncPeriod)
 
@@ -804,7 +838,16 @@ func (wfc *WorkflowController) enqueueWfFromPodLabel(obj interface{}) error {
 	return nil
 }
 
-func (wfc *WorkflowController) tweakListOptions(options *metav1.ListOptions) {
+func (wfc *WorkflowController) tweakListRequestListOptions(options *metav1.ListOptions) {
+	labelSelector := labels.NewSelector().
+		Add(util.InstanceIDRequirement(wfc.Config.InstanceID))
+	options.LabelSelector = labelSelector.String()
+	// `ResourceVersion=0` does not honor the `limit` in API calls, which results in making significant List calls
+	// without `limit`. For details, see https://github.com/argoproj/argo-workflows/pull/11343
+	options.ResourceVersion = ""
+}
+
+func (wfc *WorkflowController) tweakWatchRequestListOptions(options *metav1.ListOptions) {
 	labelSelector := labels.NewSelector().
 		Add(util.InstanceIDRequirement(wfc.Config.InstanceID))
 	options.LabelSelector = labelSelector.String()
@@ -826,18 +869,81 @@ func getWfPriority(obj interface{}) (int32, time.Time) {
 	return int32(priority), un.GetCreationTimestamp().Time
 }
 
+// 10 minutes in the past
+const maxCompletedStoreTime = time.Second * -600
+
+// This is a helper function for expiring old records of workflows
+// completed more than maxCompletedStoreTime ago
+func (wfc *WorkflowController) cleanCompletedWorkflowsRecord() {
+	cutoff := time.Now().Add(maxCompletedStoreTime)
+	removeIndex := -1
+	wfc.recentCompletions.mutex.Lock()
+	defer wfc.recentCompletions.mutex.Unlock()
+
+	for i, val := range wfc.recentCompletions.completions {
+		if val.when.After(cutoff) {
+			removeIndex = i - 1
+			break
+		}
+	}
+	if removeIndex >= 0 {
+		wfc.recentCompletions.completions = wfc.recentCompletions.completions[removeIndex+1:]
+	}
+}
+
+// Records a workflow as recently completed in the list
+// if it isn't already in the list
+func (wfc *WorkflowController) recordCompletedWorkflow(key string) {
+	if !wfc.checkRecentlyCompleted(key) {
+		wfc.recentCompletions.mutex.Lock()
+		defer wfc.recentCompletions.mutex.Unlock()
+		wfc.recentCompletions.completions = append(wfc.recentCompletions.completions,
+			recentlyCompletedWorkflow{
+				key:  key,
+				when: time.Now(),
+			})
+	}
+}
+
+// Returns true if the workflow given by key is in the recently completed
+// list. Will perform expiry cleanup before checking.
+func (wfc *WorkflowController) checkRecentlyCompleted(key string) bool {
+	wfc.cleanCompletedWorkflowsRecord()
+	recent := false
+	wfc.recentCompletions.mutex.RLock()
+	defer wfc.recentCompletions.mutex.RUnlock()
+	for _, val := range wfc.recentCompletions.completions {
+		if val.key == key {
+			recent = true
+			break
+		}
+	}
+	return recent
+}
+
 func (wfc *WorkflowController) addWorkflowInformerHandlers(ctx context.Context) {
 	wfc.wfInformer.AddEventHandler(
 		cache.FilteringResourceEventHandler{
+			// FilterFunc is called for every operation affecting the
+			// informer cache and can be used to reject things from
+			// the cache. When they are rejected (this returns false)
+			// they will be deleted.
 			FilterFunc: func(obj interface{}) bool {
 				un, ok := obj.(*unstructured.Unstructured)
 				if !ok {
 					log.Warnf("Workflow FilterFunc: '%v' is not an unstructured", obj)
 					return false
 				}
-				return reconciliationNeeded(un)
+				needed := reconciliationNeeded(un)
+				if !needed {
+					key, _ := cache.MetaNamespaceKeyFunc(un)
+					wfc.recordCompletedWorkflow(key)
+				}
+				return needed
 			},
 			Handler: cache.ResourceEventHandlerFuncs{
+				// This function is called when a new to the informer object
+				// is to be added to the informer
 				AddFunc: func(obj interface{}) {
 					key, err := cache.MetaNamespaceKeyFunc(obj)
 					if err == nil {
@@ -847,6 +953,8 @@ func (wfc *WorkflowController) addWorkflowInformerHandlers(ctx context.Context) 
 						wfc.throttler.Add(key, priority, creation)
 					}
 				},
+				// This function is called when an updated (we already know about this object)
+				// is to be updated in the informer
 				UpdateFunc: func(old, new interface{}) {
 					oldWf, newWf := old.(*unstructured.Unstructured), new.(*unstructured.Unstructured)
 					// this check is very important to prevent doing many reconciliations we do not need to do
@@ -860,12 +968,15 @@ func (wfc *WorkflowController) addWorkflowInformerHandlers(ctx context.Context) 
 						wfc.throttler.Add(key, priority, creation)
 					}
 				},
+				// This function is called when an object is to be removed
+				// from the informer
 				DeleteFunc: func(obj interface{}) {
 					// IndexerInformer uses a delta queue, therefore for deletes we have to use this
 					// key function.
 					key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 					if err == nil {
 						wfc.releaseAllWorkflowLocks(obj)
+						wfc.recordCompletedWorkflow(key)
 						// no need to add to the queue - this workflow is done
 						wfc.throttler.Remove(key)
 					}
@@ -1123,6 +1234,10 @@ func (wfc *WorkflowController) GetManagedNamespace() string {
 		return wfc.managedNamespace
 	}
 	return wfc.Config.Namespace
+}
+
+func (wfc *WorkflowController) getMaxStackDepth() int {
+	return maxAllowedStackDepth
 }
 
 func (wfc *WorkflowController) getMetricsServerConfig() (metrics.ServerConfig, metrics.ServerConfig) {

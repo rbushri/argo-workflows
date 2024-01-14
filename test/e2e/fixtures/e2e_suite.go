@@ -37,7 +37,10 @@ const (
 	Label     = workflow.WorkflowFullName + "/test" // mark this workflow as a test
 )
 
-var defaultTimeout = env.LookupEnvDurationOr("E2E_WAIT_TIMEOUT", 60*time.Second)
+var timeoutBias = env.LookupEnvDurationOr("E2E_WAIT_TIMEOUT_BIAS", 0*time.Second)
+
+var defaultTimeout = env.LookupEnvDurationOr("E2E_WAIT_TIMEOUT", 60*time.Second) + timeoutBias
+
 var EnvFactor = env.LookupEnvIntOr("E2E_ENV_FACTOR", 1)
 
 type E2ESuite struct {
@@ -83,7 +86,7 @@ func (s *E2ESuite) TearDownSuite() {
 		_, _ = fmt.Println(color.Ize(color.Yellow, fmt.Sprintf("=== SLOW TEST:  %s", x)))
 	}
 	if s.T().Failed() {
-		s.T().Log("to learn how to diagnose failed tests: https://argoproj.github.io/argo-workflows/running-locally/#running-e2e-tests-locally")
+		s.T().Log("to learn how to diagnose failed tests: https://argo-workflows.readthedocs.io/en/latest/running-locally/#running-e2e-tests-locally")
 	}
 }
 

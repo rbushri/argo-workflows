@@ -8,7 +8,7 @@ import {ZeroState} from '../../../shared/components/zero-state';
 import {historyUrl} from '../../../shared/history';
 import {Utils} from '../../../shared/utils';
 
-export const PluginList = ({match, history}: RouteComponentProps<any>) => {
+export function PluginList({match, history}: RouteComponentProps<any>) {
     // state for URL and query parameters
     const [namespace] = useState(Utils.getNamespace(match.params.namespace) || '');
     useEffect(
@@ -34,9 +34,9 @@ export const PluginList = ({match, history}: RouteComponentProps<any>) => {
                 <pre>kubectl get cm -l workflows.argoproj.io/configmap-type=ExecutorPlugin</pre>
                 <br />
                 <p>
-                    <a href='https://argoproj.github.io/argo-workflows/plugins/'>Learn more</a>.
+                    <a href='https://argo-workflows.readthedocs.io/en/latest/plugins/'>Learn more</a>.
                 </p>
             </ZeroState>
         </Page>
     );
-};
+}

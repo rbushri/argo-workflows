@@ -1037,6 +1037,53 @@ spec:
 	})
 }
 
+func (s *ArgoServerSuite) TestArtifactServerArchivedWorkflow() {
+	var uid types.UID
+	var nodeID string
+	s.Given().
+		Workflow(`@testdata/artifact-passing-workflow.yaml`).
+		When().
+		SubmitWorkflow().
+		WaitForWorkflow(fixtures.ToBeArchived).
+		Then().
+		ExpectWorkflow(func(t *testing.T, metadata *metav1.ObjectMeta, status *wfv1.WorkflowStatus) {
+			uid = metadata.UID
+			nodeID = status.Nodes.FindByDisplayName("generate-artifact").ID
+		})
+
+	// In this case, the artifact name is a file
+	s.Run("GetArtifactByNodeID", func() {
+		s.e().GET("/artifact-files/argo/archived-workflows/{uid}/{nodeID}/outputs/hello", uid, nodeID).
+			Expect().
+			Status(200).
+			Body().
+			Contains(":) Hello Argo!")
+	})
+}
+
+func (s *ArgoServerSuite) TestArtifactServerArchivedStoppedWorkflow() {
+	var uid types.UID
+	var nodeID string
+	s.Given().
+		Workflow(`@testdata/artifact-workflow-stopped.yaml`).
+		When().
+		SubmitWorkflow().
+		WaitForWorkflow(fixtures.ToBeArchived).
+		Then().
+		ExpectWorkflow(func(t *testing.T, metadata *metav1.ObjectMeta, status *wfv1.WorkflowStatus) {
+			uid = metadata.UID
+			nodeID = status.Nodes.FindByDisplayName("create-artifact").ID
+		})
+
+	s.Run("GetArtifactByNodeID", func() {
+		s.e().GET("/artifact-files/argo/archived-workflows/{uid}/{nodeID}/outputs/artifact-creator", uid, nodeID).
+			Expect().
+			Status(200).
+			Body().
+			Contains("testing")
+	})
+}
+
 // make sure we can download an artifact
 func (s *ArgoServerSuite) TestArtifactServer() {
 	var uid types.UID
@@ -1255,6 +1302,7 @@ func (s *ArgoServerSuite) TestWorkflowServiceStream() {
 
 func (s *ArgoServerSuite) TestArchivedWorkflowService() {
 	var uid types.UID
+	var name string
 	s.Given().
 		Workflow(`
 metadata:
@@ -1273,6 +1321,7 @@ spec:
 		Then().
 		ExpectWorkflow(func(t *testing.T, metadata *metav1.ObjectMeta, status *wfv1.WorkflowStatus) {
 			uid = metadata.UID
+			name = metadata.Name
 		})
 	var failedUid types.UID
 	var failedName string
@@ -1399,12 +1448,22 @@ spec:
 		s.e().GET("/api/v1/archived-workflows/not-found").
 			Expect().
 			Status(404)
-		s.e().GET("/api/v1/archived-workflows/{uid}", uid).
+		j := s.e().GET("/api/v1/archived-workflows/{uid}", uid).
+			Expect().
+			Status(200).
+			JSON()
+		j.
+			Path("$.metadata.name").
+			NotNull()
+		j.
+			Path(fmt.Sprintf("$.metadata.labels[\"%s\"]", common.LabelKeyWorkflowArchivingStatus)).
+			Equal("Persisted")
+		s.e().GET("/api/v1/workflows/argo/" + name).
 			Expect().
 			Status(200).
 			JSON().
-			Path("$.metadata.name").
-			NotNull()
+			Path(fmt.Sprintf("$.metadata.labels[\"%s\"]", common.LabelKeyWorkflowArchivingStatus)).
+			Equal("Archived")
 	})
 
 	s.Run("DeleteForRetry", func() {

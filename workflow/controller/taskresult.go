@@ -31,6 +31,9 @@ func (wfc *WorkflowController) newWorkflowTaskResultInformer() cache.SharedIndex
 		},
 		func(options *metav1.ListOptions) {
 			options.LabelSelector = labelSelector
+			// `ResourceVersion=0` does not honor the `limit` in API calls, which results in making significant List calls
+			// without `limit`. For details, see https://github.com/argoproj/argo-workflows/pull/11343
+			options.ResourceVersion = ""
 		},
 	)
 	informer.AddEventHandler(
@@ -50,33 +53,50 @@ func (wfc *WorkflowController) newWorkflowTaskResultInformer() cache.SharedIndex
 }
 
 func (woc *wfOperationCtx) taskResultReconciliation() {
+
 	objs, _ := woc.controller.taskResultInformer.GetIndexer().ByIndex(indexes.WorkflowIndex, woc.wf.Namespace+"/"+woc.wf.Name)
 	woc.log.WithField("numObjs", len(objs)).Info("Task-result reconciliation")
 	for _, obj := range objs {
 		result := obj.(*wfv1.WorkflowTaskResult)
+		resultName := result.GetName()
+
+		woc.log.Debugf("task result:\n%+v", result)
+		woc.log.Debugf("task result name:\n%+v", resultName)
+
+		// If the task result is completed, set the state to true.
+		if result.Labels[common.LabelKeyReportOutputsCompleted] == "true" {
+			woc.log.Debugf("Marking task result complete %s", resultName)
+			woc.wf.Status.MarkTaskResultComplete(resultName)
+		} else {
+			woc.log.Debugf("Marking task result incomplete %s", resultName)
+			woc.wf.Status.MarkTaskResultIncomplete(resultName)
+		}
+
 		nodeID := result.Name
-		old, exist := woc.wf.Status.Nodes[nodeID]
-		if !exist {
+		old, err := woc.wf.Status.Nodes.Get(nodeID)
+		if err != nil {
 			continue
 		}
-		new := old.DeepCopy()
+		newNode := old.DeepCopy()
 		if result.Outputs.HasOutputs() {
-			if new.Outputs == nil {
-				new.Outputs = &wfv1.Outputs{}
+			if newNode.Outputs == nil {
+				newNode.Outputs = &wfv1.Outputs{}
 			}
-			result.Outputs.DeepCopyInto(new.Outputs)               // preserve any existing values
-			if old.Outputs != nil && new.Outputs.ExitCode == nil { // prevent overwriting of ExitCode
-				new.Outputs.ExitCode = old.Outputs.ExitCode
+			result.Outputs.DeepCopyInto(newNode.Outputs)               // preserve any existing values
+			if old.Outputs != nil && newNode.Outputs.ExitCode == nil { // prevent overwriting of ExitCode
+				newNode.Outputs.ExitCode = old.Outputs.ExitCode
 			}
+			// Add outputs to global scope here to ensure that they are reflected in archive.
+			woc.addOutputsToGlobalScope(newNode.Outputs)
 		}
 		if result.Progress.IsValid() {
-			new.Progress = result.Progress
+			newNode.Progress = result.Progress
 		}
-		if !reflect.DeepEqual(&old, new) {
+		if !reflect.DeepEqual(&old, newNode) {
 			woc.log.
 				WithField("nodeID", nodeID).
 				Info("task-result changed")
-			woc.wf.Status.Nodes[nodeID] = *new
+			woc.wf.Status.Nodes.Set(nodeID, *newNode)
 			woc.updated = true
 		}
 	}
